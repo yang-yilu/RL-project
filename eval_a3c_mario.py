@@ -33,10 +33,14 @@ def evaluate(num_episodes=5, render=True):
         while not done:
             s = preprocess_state(state).to(device)
 
+            # inside the while not done loop:
             with torch.no_grad():
-                logits, value = model(s)
-                # Greedy action (argmax over policy)
-                action = torch.argmax(logits, dim=-1).item()
+                logits, _ = model(s)
+                probs = torch.softmax(logits, dim=-1)
+                dist = torch.distributions.Categorical(probs)
+                action = dist.sample().item()
+
+
 
             next_state, reward, done, info = env.step(action)
             ep_reward += reward
@@ -57,4 +61,4 @@ def evaluate(num_episodes=5, render=True):
 
 
 if __name__ == "__main__":
-    evaluate(num_episodes=100, render=True)
+    evaluate(num_episodes=100, render=False)
