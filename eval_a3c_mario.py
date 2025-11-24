@@ -61,4 +61,4 @@ def evaluate(num_episodes=5, render=True):
 
 
 if __name__ == "__main__":
-    evaluate(num_episodes=100, render=False)
+    evaluate(num_episodes=100, render=True)
