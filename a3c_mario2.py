@@ -30,9 +30,8 @@ SAVE_PATH        = "./a3c_mario.pth"
 # =========================
 #  Mario env + preprocessing
 # =========================
-# Which actions are "jump" actions?
 
-# We detect them by checking for 'A' in the SIMPLE_MOVEMENT list.
+# Which actions are "jump" actions? We detect them by checking for 'A' in SIMPLE_MOVEMENT.
 JUMP_ACTIONS = [i for i, a in enumerate(SIMPLE_MOVEMENT) if "A" in a]
 print("JUMP_ACTIONS indices:", JUMP_ACTIONS, "->", [SIMPLE_MOVEMENT[i] for i in JUMP_ACTIONS])
 
@@ -70,6 +69,7 @@ class StickyJumpEnv(gym.Wrapper):
                 self._hold = 0
 
         return self.env.step(act)
+
 
 class GrayResizeObs(gym.ObservationWrapper):
     """Convert RGB frames to 84x84 grayscale."""
@@ -169,14 +169,13 @@ def make_mario_env():
     env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
 
-    # NEW: make jump actions sticky so one decision == a full jump
+    # Sticky jump so one decision == a full jump
     env = StickyJumpEnv(env, hold_frames=4, jump_actions=JUMP_ACTIONS)
 
     env = ProgressRewardWrapper(env)
     env = GrayResizeObs(env)
     env = FrameStack(env, k=4)
     return env
-
 
 
 # =========================
@@ -216,9 +215,14 @@ def preprocess_state(state):
 
 def worker_process(rank, global_model, optimizer,
                    global_counter, global_episode, print_lock):
-    print(f"Worker {rank} starting")
+    # Choose device for this worker
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Worker {rank} starting on device: {device}")
+
     env = make_mario_env()
-    local_model = ActorCriticNet(num_actions=env.action_space.n)
+
+    # Local model lives on device (GPU if available)
+    local_model = ActorCriticNet(num_actions=env.action_space.n).to(device)
     local_model.load_state_dict(global_model.state_dict())
 
     recent_rewards = deque(maxlen=10)
@@ -240,7 +244,7 @@ def worker_process(rank, global_model, optimizer,
 
             t = 0
             while t < T_MAX and not done:
-                s = preprocess_state(state)
+                s = preprocess_state(state).to(device)
                 logits, value = local_model(s)
 
                 probs = F.softmax(logits, dim=-1)
@@ -256,7 +260,7 @@ def worker_process(rank, global_model, optimizer,
 
                 log_probs.append(log_prob)
                 values.append(value.squeeze(0))
-                rewards.append(torch.tensor(reward, dtype=torch.float32))
+                rewards.append(torch.tensor(reward, dtype=torch.float32, device=device))
                 entropies.append(entropy)
 
                 state = next_state
@@ -270,9 +274,9 @@ def worker_process(rank, global_model, optimizer,
 
             # Bootstrap value
             if done:
-                R = torch.zeros(1)
+                R = torch.zeros(1, device=device)
             else:
-                s = preprocess_state(state)
+                s = preprocess_state(state).to(device)
                 _, value = local_model(s)
                 R = value.detach().squeeze(0)
 
@@ -288,22 +292,26 @@ def worker_process(rank, global_model, optimizer,
 
             loss = policy_loss + VALUE_LOSS_COEF * value_loss
 
-            # ---- FIX: clear local grads before backward ----
+            # Clear grads
             local_model.zero_grad()
             optimizer.zero_grad()
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(local_model.parameters(), 40.0)
 
-            # copy local grads into shared global model
+            # Copy local (GPU) grads back to global (CPU) params
             for global_param, local_param in zip(global_model.parameters(),
                                                  local_model.parameters()):
+                if local_param.grad is None:
+                    continue
+                g_grad = local_param.grad.detach().cpu()
                 if global_param.grad is None:
-                    global_param.grad = local_param.grad.clone()
+                    global_param.grad = g_grad.clone()
                 else:
-                    global_param.grad.copy_(local_param.grad)
+                    global_param.grad.copy_(g_grad)
 
             optimizer.step()
+            # Sync local params from updated global (CPU -> GPU)
             local_model.load_state_dict(global_model.state_dict())
 
             if done:
@@ -334,6 +342,7 @@ def main():
     n_actions = tmp_env.action_space.n
     tmp_env.close()
 
+    # Global model stays on CPU (for share_memory and optimizer)
     global_model = ActorCriticNet(num_actions=n_actions)
     global_model.share_memory()
 
