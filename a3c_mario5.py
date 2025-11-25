@@ -1,3 +1,5 @@
+# a3c_mario5.py
+
 import time
 from collections import deque
 
@@ -8,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.multiprocessing as mp
+from torch.distributions import Categorical
 
 import gym_super_mario_bros
 from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
@@ -17,28 +20,30 @@ from nes_py.wrappers import JoypadSpace
 # =========================
 #  Hyperparameters
 # =========================
-GAMMA            = 0.99
-ENTROPY_BETA     = 0.01        # less forced randomness than 0.02
-VALUE_LOSS_COEF  = 0.5
-LR               = 1e-4        # slightly higher LR than 5e-5
-T_MAX            = 5           # shorter rollouts for easier credit assignment
-NUM_WORKERS      = 4
-MAX_GLOBAL_STEPS = 500_000   # more total experience
-SAVE_PATH        = "./a3c_mario3.pth"
+GAMMA             = 0.99
+BASE_ENTROPY_BETA = 0.02      # will be decayed as steps increase
+VALUE_LOSS_COEF   = 0.5
+LR                = 5e-5      # smaller LR for stability
+T_MAX             = 20        # longer unrolls
+NUM_WORKERS       = 4
+MAX_GLOBAL_STEPS  = 3_000_000
+SAVE_PATH         = "./a3c_mario3.pth"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
 
 
 # =========================
-#  Mario env + preprocessing
+#  Actions & jump helper
 # =========================
+
 # Only treat RIGHT+JUMP actions as "big jumps"
 JUMP_ACTIONS = [
     i for i, a in enumerate(SIMPLE_MOVEMENT)
     if ("A" in a and "right" in a)
 ]
-print("JUMP_ACTIONS indices:", JUMP_ACTIONS, "->", [SIMPLE_MOVEMENT[i] for i in JUMP_ACTIONS])
+print("JUMP_ACTIONS indices:", JUMP_ACTIONS,
+      "->", [SIMPLE_MOVEMENT[i] for i in JUMP_ACTIONS])
 
 
 class StickyJumpEnv(gym.Wrapper):
@@ -46,7 +51,7 @@ class StickyJumpEnv(gym.Wrapper):
     If the agent chooses a jump-related action, keep repeating it
     for 'hold_frames' steps so a single choice creates a full jump.
     """
-    def __init__(self, env, hold_frames=8, jump_actions=None):
+    def __init__(self, env, hold_frames=5, jump_actions=None):
         super().__init__(env)
         self.hold_frames = hold_frames
         self.jump_actions = set(jump_actions or [])
@@ -106,6 +111,7 @@ class FrameStack(gym.Wrapper):
     def reset(self):
         obs = self.env.reset()
         obs = self._process_obs(obs)
+        self.frames.clear()
         for _ in range(self.k):
             self.frames.append(obs)
         return self._get_obs()
@@ -124,150 +130,153 @@ class FrameStack(gym.Wrapper):
         return np.stack(self.frames, axis=0)
 
 
+class BaseRewardInfoWrapper(gym.Wrapper):
+    """
+    Simple wrapper that just ensures info["base_reward"] is always set to
+    the true environment reward, without changing it.
+    Used for evaluation (no shaping).
+    """
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        info = dict(info)
+        info.setdefault("base_reward", float(reward))
+        return obs, reward, done, info
+
+
 class ProgressRewardWrapper(gym.Wrapper):
     """
-    Shaped reward to help the agent understand:
-      - Forward progress is good (x_pos).
-      - Standing still / stalling is bad (idle penalty).
-      - Falling into gaps is bad (fall + pit death penalty).
-      - Death is bad (death_penalty).
-      - Reaching the flag is very good (flag_bonus).
-      - Coins and score increases are good (often from blocks & stomping enemies).
+    Shaped reward (for training):
 
-    Reward:
-      + dx_scale * max(0, Δx)
-      + coin_scale * Δcoins (if > 0)
-      + score_scale * max(0, Δscore)
-      - idle_penalty if stuck too long
-      - fall_penalty * Δy_down
-      - death_penalty if episode ends without flag
-      - pit_death_penalty if death appears to be a pit (large y_pos)
-      + flag_bonus if flag reached
+      shaped = + dx_scale * max(0, Δx)
+               - step_cost each step
+               + survival_bonus every `survival_every` steps IF enough progress
+               - death_penalty if done without flag
+               - enemy_penalty if we detect life loss on the death step
+               + flag_bonus if flag reached
 
-    NOTE: No constant per-step cost anymore. This avoids
-    "suicide to end episode early" behavior.
+    We also:
+      - keep base_reward (raw env reward) in info["base_reward"]
+      - store un-clipped shaped in info["shaped_raw"]
+      - optionally clip per-step shaped reward (non-terminal) into [clip_min, clip_max]
+        and return that clipped value as the reward.
     """
-    def __init__(self, env,
-                 dx_scale=0.05,      # forward progress
-                 death_penalty=25.0,
-                 flag_bonus=100.0,
-                 idle_penalty=0.05,
-                 max_idle_steps=25,
-                 coin_scale=0.5,     # reward per coin
-                 score_scale=0.001,  # reward per score increase
-                 fall_penalty=0.02,  # penalty per downward movement
-                 pit_y_threshold=80, # if y_pos > this at death, likely fell into pit
-                 pit_death_penalty=35.0
-                 ):
+    def __init__(self,
+                 env,
+                 dx_scale=0.05,
+                 step_cost=0.0005,
+                 death_penalty=8.0,
+                 enemy_penalty=5.0,
+                 flag_bonus=50.0,
+                 survival_every=60,
+                 survival_bonus=0.5,
+                 min_dx_for_bonus=3.0,
+                 clip_rewards=True,
+                 clip_min=-20.0,
+                 clip_max=20.0):
         super().__init__(env)
         self.dx_scale = dx_scale
+        self.step_cost = step_cost
         self.death_penalty = death_penalty
+        self.enemy_penalty = enemy_penalty
         self.flag_bonus = flag_bonus
-        self.idle_penalty = idle_penalty
-        self.max_idle_steps = max_idle_steps
-        self.coin_scale = coin_scale
-        self.score_scale = score_scale
-        self.fall_penalty = fall_penalty
-        self.pit_y_threshold = pit_y_threshold
-        self.pit_death_penalty = pit_death_penalty
+        self.survival_every = survival_every
+        self.survival_bonus = survival_bonus
+        self.min_dx_for_bonus = min_dx_for_bonus
 
-        self.last_x = 0
-        self.last_coins = 0
-        self.last_score = 0
-        self.last_y = 0
-        self.idle_steps = 0
+        self.clip_rewards = clip_rewards
+        self.clip_min = clip_min
+        self.clip_max = clip_max
 
-    def reset(self):
-        obs = self.env.reset()
+        self._reset_internal_state()
+
+    def _reset_internal_state(self):
         self.last_x = 0
-        self.last_coins = 0
-        self.last_score = 0
-        self.last_y = 0
-        self.idle_steps = 0
+        self.steps_alive = 0
+        self.x_at_last_bonus = 0
+        self.last_life = None
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        self._reset_internal_state()
         return obs
 
     def step(self, action):
-        obs, _, done, info = self.env.step(action)
+        obs, env_r, done, info = self.env.step(action)
+        info = dict(info)
 
-        x     = info.get("x_pos", 0)
-        coins = info.get("coins", 0)
-        score = info.get("score", 0)
-        y     = info.get("y_pos", 0)
+        # Always expose the raw env reward
+        info.setdefault("base_reward", float(env_r))
 
-        # ---------- Forward progress ----------
+        # Forward progress
+        x = info.get("x_pos", 0)
         dx = max(0, x - self.last_x)
         self.last_x = x
 
-        shaped = self.dx_scale * dx  # no step_cost
+        shaped = self.dx_scale * dx - self.step_cost
 
-        # ---------- Coins & score (blocks, enemies, etc.) ----------
-        dcoins = coins - self.last_coins
-        self.last_coins = coins
-        if dcoins > 0:
-            shaped += self.coin_scale * dcoins
-
-        dscore = max(0, score - self.last_score)
-        self.last_score = score
-        if dscore > 0:
-            shaped += self.score_scale * dscore
-
-        # ---------- Idle / stalling ----------
-        if dx > 0:
-            self.idle_steps = 0
-        else:
-            self.idle_steps += 1
-            if self.idle_steps >= self.max_idle_steps:
-                shaped -= self.idle_penalty
-
-        # ---------- Falling / gaps ----------
-        dy = y - self.last_y
-        self.last_y = y
-
-        # In NES coordinates, moving "down" on screen is increasing y,
-        # so dy > 0 means falling.
-        if dy > 0:
-            shaped -= self.fall_penalty * dy
+        # Survival bonus: only if alive AND we've moved enough since last bonus
+        self.steps_alive += 1
+        if (not done) and (self.steps_alive % self.survival_every == 0):
+            if (self.last_x - self.x_at_last_bonus) >= self.min_dx_for_bonus:
+                shaped += self.survival_bonus
+                self.x_at_last_bonus = self.last_x
 
         flag_get = info.get("flag_get", False)
+        life = info.get("life", None)
+        enemy_hit = False
 
-        # ---------- Death vs success ----------
-        if done and not flag_get:
-            # Generic death penalty (covers goomba hits, fireball, etc.)
-            shaped -= self.death_penalty
+        # Track life loss (proxy for enemy / bad hit)
+        if life is not None:
+            if self.last_life is None:
+                self.last_life = life
+            elif life < self.last_life:
+                enemy_hit = True
+                self.last_life = life
 
-            # Extra penalty if it "looks like" a pit death (y is large)
-            if y > self.pit_y_threshold:
-                shaped -= self.pit_death_penalty
+        # Terminal adjustments
+        if done:
+            if flag_get:
+                shaped += self.flag_bonus
+            else:
+                shaped -= self.death_penalty
+                if enemy_hit:
+                    shaped -= self.enemy_penalty
 
-        # Big bonus for reaching the flag
-        if flag_get:
-            shaped += self.flag_bonus
+        # Diagnostics
+        info["shaped_raw"] = float(shaped)
 
-        return obs, shaped, done, info
+        # Clip only NON-terminal steps to keep variance under control
+        if self.clip_rewards and not done:
+            shaped_clipped = float(np.clip(shaped, self.clip_min, self.clip_max))
+            info["shaped_clipped"] = shaped_clipped
+            reward = shaped_clipped
+        else:
+            reward = float(shaped)
+
+        if done:
+            # reset counters for next episode
+            self._reset_internal_state()
+
+        return obs, reward, done, info
 
 
-def make_mario_env():
+def make_mario_env(train: bool = True, use_shaped_env: bool = True):
+    """
+    Unified env constructor.
+
+    - train=True,  use_shaped_env=True  -> A3C training w/ ProgressRewardWrapper
+    - train=False, use_shaped_env=True  -> evaluation with shaped reward
+    - train=False, use_shaped_env=False -> evaluation with raw env reward
+    """
     env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
     env = JoypadSpace(env, SIMPLE_MOVEMENT)
+    env = StickyJumpEnv(env, hold_frames=5, jump_actions=JUMP_ACTIONS)
 
-    # Sticky big jump for right+jump
-    env = StickyJumpEnv(env, hold_frames=8, jump_actions=JUMP_ACTIONS)
-
-    # Strong incentives for progress, coins, blocks/enemies (via score),
-    # and explicit penalties for stalling and falling.
-    env = ProgressRewardWrapper(
-        env,
-        dx_scale=0.05,
-        death_penalty=25.0,
-        flag_bonus=100.0,
-        idle_penalty=0.05,
-        max_idle_steps=25,
-        coin_scale=0.5,
-        score_scale=0.001,
-        fall_penalty=0.02,
-        pit_y_threshold=80,
-        pit_death_penalty=35.0,
-    )
+    if train and use_shaped_env:
+        env = ProgressRewardWrapper(env)
+    else:
+        # Just tag base_reward and leave reward unchanged
+        env = BaseRewardInfoWrapper(env)
 
     env = GrayResizeObs(env)
     env = FrameStack(env, k=4)
@@ -309,6 +318,16 @@ def preprocess_state(state: np.ndarray) -> torch.Tensor:
     return x.unsqueeze(0)
 
 
+def get_entropy_beta(global_steps: int) -> float:
+    """
+    Simple linear decay of entropy coefficient:
+    starts at BASE_ENTROPY_BETA and decays to ~0.1 * BASE_ENTROPY_BETA
+    by 80% of MAX_GLOBAL_STEPS, then stays there.
+    """
+    frac = min(global_steps / (0.8 * MAX_GLOBAL_STEPS), 1.0)
+    return BASE_ENTROPY_BETA * (1.0 - 0.9 * frac)
+
+
 # =========================
 #  Worker process
 # =========================
@@ -316,9 +335,9 @@ def preprocess_state(state: np.ndarray) -> torch.Tensor:
 def worker_process(rank, global_model, optimizer,
                    global_counter, global_episode, print_lock):
     print(f"Worker {rank} starting on device {DEVICE}")
-    env = make_mario_env()
+    env = make_mario_env(train=True, use_shaped_env=True)
 
-    # Local worker model lives on GPU/CPU (DEVICE)
+    # Local worker model lives on DEVICE
     local_model = ActorCriticNet(num_actions=env.action_space.n).to(DEVICE)
     local_model.load_state_dict(global_model.state_dict())
     local_model.train()
@@ -326,52 +345,60 @@ def worker_process(rank, global_model, optimizer,
     recent_rewards = deque(maxlen=10)
 
     while True:
+        # Check global step limit before starting a new episode
         with global_counter.get_lock():
             if global_counter.value >= MAX_GLOBAL_STEPS:
                 break
 
         state = env.reset()
-        episode_reward = 0.0
         done = False
+        episode_shaped = 0.0
+        episode_base = 0.0
 
         while not done:
             log_probs = []
             values    = []
             rewards   = []
             entropies = []
+            steps_this_batch = 0
 
-            t = 0
-            while t < T_MAX and not done:
+            # Collect up to T_MAX steps
+            while steps_this_batch < T_MAX and not done:
                 s = preprocess_state(state).to(DEVICE)
                 logits, value = local_model(s)
 
                 probs = F.softmax(logits, dim=-1)
                 log_probs_all = F.log_softmax(logits, dim=-1)
-                dist = torch.distributions.Categorical(probs)
+                dist = Categorical(probs)
                 action = dist.sample()
 
                 log_prob = log_probs_all[0, action]
                 entropy  = -(probs * log_probs_all).sum()
 
                 next_state, reward, done, info = env.step(action.item())
-                episode_reward += reward
+
+                base_r = info.get("base_reward", reward)
+                shaped_raw = info.get("shaped_raw", reward)
+
+                episode_base += float(base_r)
+                episode_shaped += float(shaped_raw)
 
                 log_probs.append(log_prob)
-                values.append(value.squeeze(0))          # tensor on DEVICE
+                values.append(value.squeeze(0))
                 rewards.append(torch.tensor(reward, dtype=torch.float32, device=DEVICE))
                 entropies.append(entropy)
 
                 state = next_state
-                t += 1
+                steps_this_batch += 1
 
-                with global_counter.get_lock():
-                    global_counter.value += 1
-                    if global_counter.value >= MAX_GLOBAL_STEPS:
-                        done = True
-                        break
+            # Update global step counter once per rollout
+            with global_counter.get_lock():
+                global_counter.value += steps_this_batch
+                current_steps = global_counter.value
+                reached_limit = (global_counter.value >= MAX_GLOBAL_STEPS)
 
             # Bootstrap value
-            if done:
+            if done or reached_limit:
                 R = torch.zeros(1, device=DEVICE)
             else:
                 s = preprocess_state(state).to(DEVICE)
@@ -381,12 +408,14 @@ def worker_process(rank, global_model, optimizer,
             policy_loss = torch.zeros(1, device=DEVICE)
             value_loss  = torch.zeros(1, device=DEVICE)
 
+            entropy_beta = get_entropy_beta(current_steps)
+
             for i in reversed(range(len(rewards))):
                 R = rewards[i] + GAMMA * R
                 advantage = R - values[i]
 
                 value_loss = value_loss + advantage.pow(2)
-                policy_loss = policy_loss - log_probs[i] * advantage.detach() - ENTROPY_BETA * entropies[i]
+                policy_loss = policy_loss - log_probs[i] * advantage.detach() - entropy_beta * entropies[i]
 
             loss = policy_loss + VALUE_LOSS_COEF * value_loss
 
@@ -411,67 +440,24 @@ def worker_process(rank, global_model, optimizer,
             # sync local weights from updated global model
             local_model.load_state_dict(global_model.state_dict())
 
-            if done:
-                recent_rewards.append(episode_reward)
+            if done or reached_limit:
+                recent_rewards.append(episode_shaped)
                 with global_episode.get_lock():
                     global_episode.value += 1
                     ep = global_episode.value
-                avg10 = np.mean(recent_rewards)
+                avg10 = float(np.mean(recent_rewards)) if len(recent_rewards) > 0 else 0.0
                 with print_lock:
-                    print(f"[Worker {rank}] Ep {ep} | "
-                          f"Global steps {global_counter.value} | "
-                          f"Reward {episode_reward:.1f} | "
-                          f"Avg10 {avg10:.1f}")
+                    print(
+                        f"[Worker {rank}] Ep {ep} | "
+                        f"Global steps {current_steps} | "
+                        f"Base {episode_base:.1f} | "
+                        f"Shaped {episode_shaped:.1f} | "
+                        f"Avg10_shaped {avg10:.1f}"
+                    )
                 break
 
     env.close()
     print(f"Worker {rank} finished.")
-
-
-# =========================
-#  Evaluation (sampling vs greedy)
-# =========================
-
-EVAL_USE_SAMPLING = True  # True = sample from policy; False = greedy argmax
-
-
-def evaluate(num_episodes=35, render=False):
-    """
-    After training, load the saved model and run episodes with
-    either sampling or greedy action selection.
-    """
-    env = make_mario_env()
-    n_actions = env.action_space.n
-
-    model = ActorCriticNet(num_actions=n_actions).to(DEVICE)
-    model.load_state_dict(torch.load(SAVE_PATH, map_location=DEVICE))
-    model.eval()
-
-    for ep in range(1, num_episodes + 1):
-        state = env.reset()
-        done = False
-        ep_reward = 0.0
-
-        while not done:
-            s = preprocess_state(state).to(DEVICE)
-            with torch.no_grad():
-                logits, _ = model(s)
-                if EVAL_USE_SAMPLING:
-                    probs = F.softmax(logits, dim=-1)
-                    action = torch.multinomial(probs, num_samples=1).item()
-                else:
-                    action = torch.argmax(logits, dim=-1).item()
-
-            next_state, reward, done, info = env.step(action)
-            ep_reward += reward
-            state = next_state
-
-            if render:
-                env.render()
-
-        print(f"Episode {ep}: reward = {ep_reward:.1f}")
-
-    env.close()
 
 
 # =========================
@@ -482,7 +468,7 @@ def main():
     mp.set_start_method("spawn", force=True)
 
     # Figure out action space
-    tmp_env = make_mario_env()
+    tmp_env = make_mario_env(train=True, use_shaped_env=True)
     n_actions = tmp_env.action_space.n
     tmp_env.close()
 
@@ -511,9 +497,6 @@ def main():
 
     torch.save(global_model.state_dict(), SAVE_PATH)
     print(f"Training finished. Model saved to {SAVE_PATH}")
-
-    # Run eval after training (you can set render=True if you want visuals)
-    evaluate(num_episodes=35, render=False)
 
 
 if __name__ == "__main__":
