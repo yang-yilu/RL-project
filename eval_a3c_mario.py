@@ -1,122 +1,131 @@
-# eval_a3c_mario.py
-
-import time
+import os
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
-from a3c_mario5 import (
-    ActorCriticNet,
-    make_mario_env,
-    preprocess_state,
-    SAVE_PATH,
-)
+import cv2
+import gym_super_mario_bros
+from gym_super_mario_bros.actions import SIMPLE_MOVEMENT
+from nes_py.wrappers import JoypadSpace
 
-
-def make_eval_env(use_shaped_env: bool):
-    """
-    Evaluation env:
-      - use_shaped_env=True  -> still uses ProgressRewardWrapper
-      - use_shaped_env=False -> raw NES reward, no shaping
-    """
-    # train=False ensures we don't use training-only settings
-    return make_mario_env(train=False, use_shaped_env=use_shaped_env)
+MODEL_PATH = "./a3c_mario_new.pth"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
 
 
-def evaluate(
-    num_episodes: int = 10,
-    render: bool = True,
-    use_shaped_env: bool = False,
-    use_sampling: bool = False,
-    use_random_policy: bool = False,
-):
-    """
-    - use_shaped_env = True  -> run with shaped rewards (ProgressRewardWrapper)
-      use_shaped_env = False -> run with raw NES rewards.
-    - use_sampling = True    -> sample from policy (stochastic)
-      use_sampling = False   -> greedy argmax
-    - use_random_policy      -> ignore network and pick random actions
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+# -----------------------------
+# Network (must match training)
+# -----------------------------
+class ActorCritic(nn.Module):
+    def __init__(self, num_actions):
+        super().__init__()
 
-    env = make_eval_env(use_shaped_env=use_shaped_env)
-    n_actions = env.action_space.n
+        self.conv = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU()
+        )
 
-    model = ActorCriticNet(num_actions=n_actions).to(device)
-    state_dict = torch.load(SAVE_PATH, map_location=device)
+        self.fc = nn.Sequential(
+            nn.Linear(3136, 512),
+            nn.ReLU()
+        )
+
+        self.policy = nn.Linear(512, num_actions)
+        self.value = nn.Linear(512, 1)
+
+    def forward(self, x):
+        x = x / 255.0
+        x = self.conv(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        logits = self.policy(x)
+        value = self.value(x)
+        return logits, value
+
+
+# -----------------------------
+# Preprocessing helpers
+# -----------------------------
+def preprocess(obs):
+    """Turn RGB obs into 84x84 grayscale."""
+    obs = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+    obs = cv2.resize(obs, (84, 84))
+    return obs
+
+
+def stack_frames(frames, new_frame):
+    frames[:-1] = frames[1:]
+    frames[-1] = new_frame
+    return frames
+
+
+# -----------------------------
+# Evaluation loop
+# -----------------------------
+def evaluate(num_episodes=5, render=False):
+    # Show the action mapping so we know what index = what
+    print("Evaluating with SIMPLE_MOVEMENT:")
+    for i, a in enumerate(SIMPLE_MOVEMENT):
+        print(f"{i}: {a}")
+
+    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
+    env = JoypadSpace(env, SIMPLE_MOVEMENT)
+
+    model = ActorCritic(len(SIMPLE_MOVEMENT)).to(DEVICE)
+
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file '{MODEL_PATH}' not found. "
+            "Make sure you trained and saved with a3c_mario5.py."
+        )
+
+    state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
     model.load_state_dict(state_dict)
     model.eval()
 
-    all_base_rewards = []
-    all_shaped_rewards = []
-
     for ep in range(1, num_episodes + 1):
-        state = env.reset()
+        obs = env.reset()
+        frame = preprocess(obs)
+        frames = np.stack([frame] * 4, axis=0).astype(np.uint8)
+
         done = False
-        ep_base = 0.0    # raw env reward
-        ep_shaped = 0.0  # shaped reward if available
+        env_return = 0.0
+        final_x = 40
+        max_x = 40
 
         while not done:
-            if use_random_policy:
-                action = env.action_space.sample()
-            else:
-                s = preprocess_state(state).to(device)
-                with torch.no_grad():
-                    logits, _ = model(s)
-                    if use_sampling:
-                        probs = F.softmax(logits, dim=-1)
-                        m = Categorical(probs)
-                        action = m.sample().item()
-                    else:
-                        # Greedy
-                        action = torch.argmax(logits, dim=-1).item()
-
-            next_state, reward, done, info = env.step(action)
-
-            base_r = info.get("base_reward", reward)
-            shaped_r = info.get("shaped_raw", None)
-
-            ep_base += float(base_r)
-            if shaped_r is not None:
-                ep_shaped += float(shaped_r)
-
-            state = next_state
-
             if render:
                 env.render()
-                time.sleep(1 / 60.0)
 
-        all_base_rewards.append(ep_base)
-        all_shaped_rewards.append(ep_shaped)
+            s = torch.tensor(frames, dtype=torch.float32, device=DEVICE).unsqueeze(0)
 
-        if ep_shaped != 0.0:
-            print(
-                f"Episode {ep}: base_reward = {ep_base:.1f}, "
-                f"shaped_reward = {ep_shaped:.1f}"
-            )
-        else:
-            print(f"Episode {ep}: base_reward = {ep_base:.1f}")
+            with torch.no_grad():
+                logits, _ = model(s)
+                probs = F.softmax(logits, dim=1)
+                action = probs.argmax(dim=1).item()  # greedy
+
+            obs, r, done, info = env.step(action)
+            env_return += r
+
+            x_pos = info.get("x_pos", final_x)
+            final_x = x_pos
+            if x_pos > max_x:
+                max_x = x_pos
+
+            new_frame = preprocess(obs)
+            frames = stack_frames(frames, new_frame)
+
+        print(
+            f"[EVAL] Episode {ep}: "
+            f"env return = {env_return:.1f}, "
+            f"final x_pos = {final_x}, max x_pos = {max_x}"
+        )
 
     env.close()
 
-    avg_base = sum(all_base_rewards) / len(all_base_rewards)
-    if any(r != 0.0 for r in all_shaped_rewards):
-        avg_shaped = sum(all_shaped_rewards) / len(all_shaped_rewards)
-        print(
-            f"\nAverage base reward over {num_episodes} eps: {avg_base:.1f} "
-            f"(avg shaped: {avg_shaped:.1f})"
-        )
-    else:
-        print(f"\nAverage base reward over {num_episodes} eps: {avg_base:.1f}")
-
 
 if __name__ == "__main__":
-    # EDIT THESE FLAGS TO TEST DIFFERENT THINGS
-    evaluate(
-        num_episodes=5,
-        render=True,
-        use_shaped_env=False,   # False = raw game reward
-        use_sampling=True,     # False = greedy; True = stochastic sampling
-        use_random_policy=False # True = ignore model, purely random actions
-    )
+    # Set render=True if you actually want to watch Mario
+    evaluate(num_episodes=5, render=True)
