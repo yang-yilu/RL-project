@@ -93,27 +93,33 @@ class ProcessFrameMario(gym.Wrapper):
         status = float(info.get("player_status", self.prev_status))
         score = float(info.get("score", self.prev_score))
 
-        # === Reward shaping (same logic as original repo) ===
+        # === Reward shaping (adjusted for stable learning) ===
         reward = 0.0
 
         # Encourage positive progress, clip huge jumps.
+        # FIX: Distance reward encourages forward movement (max +2.0 per step)
         reward += min(max(distance - self.prev_distance, 0.0), 2.0)
 
         # Time penalty to discourage standing still.
-        reward += (self.prev_time - time_left) * -0.01  # Changed from -0.1 to -0.01
+        # FIX: Soft time penalty (-0.01 per time unit lost) prevents overwhelming other signals
+        reward += (self.prev_time - time_left) * -0.01
 
         # Reward for status improvements (e.g., power-ups).
+        # FIX: Status reward encourages power-ups (e.g., small -> big = +5.0)
         reward += (status - self.prev_status) * 5.0
 
         # Reward for score increases.
+        # FIX: Small score reward (0.025 per point) provides additional signal
         reward += (score - self.prev_score) * 0.025
 
         # Terminal bonus/penalty based on progress.
+        # FIX: Reduced terminal penalty from ±50.0 to ±15.0 to prevent overwhelming learning signal
+        # Level complete threshold is ~3225 pixels (end of level 1-1)
         if done:
             if distance > 3225:
-                reward += 50.0
+                reward += 15.0  # Reduced from 50.0: level complete bonus
             else:
-                reward -= 50.0
+                reward -= 15.0  # Reduced from 50.0: early termination penalty
 
         # Update shaping state.
         self.prev_distance = distance

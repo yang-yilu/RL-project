@@ -57,13 +57,29 @@ pip install gym==0.26.2 gym-super-mario-bros==7.3.0 nes-py==8.2.1 numpy opencv-p
 Run the training script:
 
 ```bash
+# Default training (2M steps, 4 workers)
 python a3c_mario6.py
+
+# Quick test run (50k steps for testing)
+python a3c_mario6.py --max-steps 50000
+
+# Custom configuration
+python a3c_mario6.py --max-steps 1000000 --workers 8 --save-path ./my_model.pth
+
+# See all options
+python a3c_mario6.py --help
 ```
 
+**Command-line arguments:**
+- `--max-steps N`: Maximum global training steps (default: 2,000,000)
+- `--workers N`: Number of worker processes (default: 4)
+- `--save-path PATH`: Path to save trained model (default: ./a3c_mario.pth)
+- `--env-id ID`: Environment ID (default: SuperMarioBros-1-1-v0)
+
 The script will:
-- Spawn 4 worker processes (configurable via `NUM_WORKERS`)
-- Train for 2,000,000 steps (configurable via `MAX_GLOBAL_STEPS`)
-- Save the model to `./a3c_mario.pth` (configurable via `SAVE_PATH`)
+- Spawn worker processes (default: 4)
+- Train for specified number of steps (default: 2,000,000)
+- Save the model to specified path (default: ./a3c_mario.pth)
 
 **Training logs look like:**
 ```
@@ -165,13 +181,15 @@ SAVE_PATH        = "./a3c_mario.pth"
 
 The reward shaping in `atari_wrapper.py` includes:
 
-- **Distance reward**: `min(max(distance - prev_distance, 0.0), 2.0)` - encourages forward progress
-- **Time penalty**: `(prev_time - time_left) * -0.01` - discourages standing still (soft penalty)
-- **Status reward**: `(status - prev_status) * 5.0` - rewards power-ups
+- **Distance reward**: `min(max(distance - prev_distance, 0.0), 2.0)` - encourages forward progress (max +2.0 per step)
+- **Time penalty**: `(prev_time - time_left) * -0.01` - discourages standing still (soft penalty, -0.01 per time unit)
+- **Status reward**: `(status - prev_status) * 5.0` - rewards power-ups (e.g., small -> big = +5.0)
 - **Score reward**: `(score - prev_score) * 0.025` - small reward for score increases
-- **Terminal bonus/penalty**: `+50.0` if distance > 3225 (level complete), else `-50.0`
+- **Terminal bonus/penalty**: `+15.0` if distance > 3225 (level complete), else `-15.0` (reduced from ±50.0 for stability)
 
-**Note:** The time penalty was reduced from `-0.1` to `-0.01` to prevent it from overwhelming learning signals.
+**Recent fixes:**
+- Terminal penalty reduced from ±50.0 to ±15.0 to prevent overwhelming the learning signal
+- Time penalty kept at -0.01 to maintain soft discouragement without dominating rewards
 
 ---
 
@@ -181,10 +199,12 @@ The reward shaping in `atari_wrapper.py` includes:
 - **RuntimeWarning: overflow encountered in ubyte_scalars**: These are harmless warnings from `gym_super_mario_bros` when Mario wraps around the screen. They're automatically suppressed in the code.
 
 ### Negative Returns
-- Early training episodes will have negative returns (around -40 to -50) because:
+- Early training episodes will have negative returns (around -15 to -25) because:
   - The agent hasn't learned to make progress
-  - The terminal penalty (-50) is applied when episodes end early
+  - The terminal penalty (-15.0) is applied when episodes end early
+  - Time penalties accumulate during episodes
 - As training progresses, returns should gradually increase as the agent learns to make forward progress.
+- With the reduced terminal penalty (±15.0 instead of ±50.0), returns should be less negative and learning should be more stable.
 
 ### Training Not Learning
 If returns stay extremely negative after many episodes, check:

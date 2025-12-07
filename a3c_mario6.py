@@ -1,9 +1,13 @@
 """
 Modern A3C trainer for Super Mario Bros using Gym / Gymnasium + PyTorch.
 Compatible with gym-super-mario-bros and nes-py via our compatibility wrappers.
+
+Usage:
+    python a3c_mario6.py [--max-steps N] [--workers N] [--save-path PATH]
 """
 
 import os
+import argparse
 import warnings
 from collections import deque
 import numpy as np
@@ -18,7 +22,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, module="gym_super_mar
 from atari_wrapper import create_mario_env  # make sure atari_wrapper.py is in same folder
 
 # ================================================================
-# Hyperparameters
+# Hyperparameters (can be overridden via command-line)
 # ================================================================
 ENV_ID = "SuperMarioBros-1-1-v0"
 GAMMA = 0.99
@@ -85,8 +89,8 @@ class SharedAdam(torch.optim.Adam):
 # ================================================================
 # Worker process
 # ================================================================
-def worker_fn(worker_id, global_model, optimizer, global_counter):
-    env = create_mario_env(ENV_ID)
+def worker_fn(worker_id, global_model, optimizer, global_counter, env_id, max_global_steps):
+    env = create_mario_env(env_id)
     local_model = ActorCritic(env.action_space.n).to(DEVICE)
     local_model.load_state_dict(global_model.state_dict())
     local_model.train()
@@ -105,7 +109,7 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
     while True:
         # Stop if we've hit the global step limit
         with global_counter.get_lock():
-            if global_counter.value >= MAX_GLOBAL_STEPS:
+            if global_counter.value >= max_global_steps:
                 break
 
         values, log_probs, rewards, entropies = [], [], [], []
@@ -150,7 +154,7 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
 
             with global_counter.get_lock():
                 global_counter.value += 1
-                if global_counter.value >= MAX_GLOBAL_STEPS:
+                if global_counter.value >= max_global_steps:
                     done = True
 
         # Skip if no steps collected (shouldn't happen, but safety check)
@@ -167,12 +171,14 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
         # Bootstrap value BEFORE resetting (critical fix!)
         # If done=True: terminal state, bootstrap with 0 (no future value)
         # If done=False: bootstrap with V(s_T) where s_T is the last state of the rollout
+        # FIX: Bootstrap must use the state AFTER the last action, which is 'state' (next_state from last step)
         if done:
             # Terminal state: no future value, bootstrap with 0
             # Use scalar tensor for consistent shape with rewards and values
             R = torch.tensor(0.0, device=DEVICE, dtype=torch.float32)
         else:
             # Non-terminal: bootstrap with value of last state in rollout
+            # 'state' is the state after the last action, which is correct for bootstrapping
             with torch.no_grad():
                 _, v = local_model(state)  # Use state from current rollout (before reset)
                 # v is shape (1, 1), squeeze to scalar for consistent computation
@@ -276,9 +282,9 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
             print(diagnostics_msg)
 
         # Logging - only when episode actually ends
-        # IMPORTANT: episode_return tracks the FULL episode reward accumulated across
-        # all rollouts until done=True. It is NOT the sum of rollout rewards.
-        # We reset episode_return only when done=True (episode actually ends).
+        # FIX: episode_return tracks the FULL episode reward accumulated across
+        # all rollouts until done=True. It is reset immediately when done=True to prevent
+        # mixing returns from different episodes if a rollout somehow spans episodes.
         # The episode counter increments only when done=True (not per rollout).
         if done:
             episode += 1  # Increment episode counter only when episode ends
@@ -291,13 +297,15 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
                 f"last policy_loss: {policy_loss.item():.4f}, "
                 f"last value_loss: {value_loss.item():.4f}"
             )
+            # FIX: Reset episode_return BEFORE resetting environment to ensure clean separation
             episode_return = 0.0  # Reset for next episode
             
-            # Reset environment AFTER logging (critical: bootstrap happens before reset)
+            # Reset environment AFTER logging and resetting episode_return
+            # (critical: bootstrap happens before reset, episode_return reset before env reset)
             obs = env.reset()
             state = torch.from_numpy(obs).float().unsqueeze(0).to(DEVICE)
 
-        if global_counter.value >= MAX_GLOBAL_STEPS:
+        if global_counter.value >= max_global_steps:
             break
 
 
@@ -306,6 +314,48 @@ def worker_fn(worker_id, global_model, optimizer, global_counter):
 # Main training launcher
 # ================================================================
 def main():
+    parser = argparse.ArgumentParser(description="Train A3C agent on Super Mario Bros")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_GLOBAL_STEPS,
+        help=f"Maximum global training steps (default: {MAX_GLOBAL_STEPS})",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=NUM_WORKERS,
+        help=f"Number of worker processes (default: {NUM_WORKERS})",
+    )
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=SAVE_PATH,
+        help=f"Path to save trained model (default: {SAVE_PATH})",
+    )
+    parser.add_argument(
+        "--env-id",
+        type=str,
+        default=ENV_ID,
+        help=f"Environment ID (default: {ENV_ID})",
+    )
+    args = parser.parse_args()
+    
+    # Use command-line arguments
+    max_steps = args.max_steps
+    num_workers = args.workers
+    save_path = args.save_path
+    env_id = args.env_id
+    
+    print("=" * 60)
+    print("A3C Training Configuration:")
+    print(f"  Environment: {env_id}")
+    print(f"  Max steps: {max_steps:,}")
+    print(f"  Workers: {num_workers}")
+    print(f"  Save path: {save_path}")
+    print(f"  Device: {DEVICE}")
+    print("=" * 60)
+    
     os.environ["OMP_NUM_THREADS"] = "1"
 
     # On Windows, make sure we use 'spawn'
@@ -315,7 +365,7 @@ def main():
         # Already set
         pass
 
-    env = create_mario_env(ENV_ID)
+    env = create_mario_env(env_id)
     num_actions = env.action_space.n
     env.close()
 
@@ -325,20 +375,29 @@ def main():
     optimizer = SharedAdam(global_model.parameters(), lr=LR)
     global_counter = mp.Value("i", 0)
 
+    print(f"\nStarting training with {num_workers} workers...")
+    print("Press Ctrl+C to stop early (model will still be saved)\n")
+
     workers = []
-    for worker_id in range(NUM_WORKERS):
+    for worker_id in range(num_workers):
         p = mp.Process(
             target=worker_fn,
-            args=(worker_id, global_model, optimizer, global_counter),
+            args=(worker_id, global_model, optimizer, global_counter, env_id, max_steps),
         )
         p.start()
         workers.append(p)
 
-    for p in workers:
-        p.join()
+    try:
+        for p in workers:
+            p.join()
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user. Stopping workers...")
+        for p in workers:
+            p.terminate()
+            p.join()
 
-    torch.save(global_model.state_dict(), SAVE_PATH)
-    print("Training finished. Model saved to", SAVE_PATH)
+    torch.save(global_model.state_dict(), save_path)
+    print(f"\nTraining finished. Model saved to {save_path}")
 
 
 if __name__ == "__main__":
